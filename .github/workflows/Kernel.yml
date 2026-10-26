@@ -12,24 +12,26 @@ jobs:
           sudo rm -rf /usr/share/dotnet /etc/mysql /etc/php /usr/local/lib/android
           sudo apt-get clean
 
-      - name: Install Build Dependencies
+      - name: Install Build Dependencies & Clang Toolchain
         run: |
           sudo apt-get update
           sudo apt-get install -y git build-essential bc bison flex libssl-dev libelf-dev \
-            lz4 xz-utils wget curl python3 zip unzip cpio pahole
+            lz4 xz-utils wget curl python3 zip unzip cpio pahole \
+            clang-14 lld-14 llvm-14
 
-      - name: Download Official Google Clang Toolchain
+      - name: Setup Clang-14 as Default Toolchain
         run: |
-          mkdir -p $HOME/clang
-          wget -qO- https://android.googlesource.com/platform/prebuilts/clang/host/linux-x86/+archive/refs/heads/main/clang-r416183b.tar.gz | tar -xzf - -C $HOME/clang
+          mkdir -p $HOME/clang/bin
+          for tool in clang clang++ ld.lld llvm-ar llvm-nm llvm-objcopy llvm-objdump llvm-readelf llvm-size llvm-strip; do
+            ln -sf /usr/bin/${tool}-14 $HOME/clang/bin/${tool}
+          done
 
       - name: Clone Exact Kernel Source (5.10.168 - 61344663df42)
         run: |
           mkdir kernel && cd kernel
           git init
           git remote add origin https://android.googlesource.com/kernel/common
-          # আপনার ফোনের হুবহু কমিট হ্যাশ ফেচ করা হচ্ছে, না পেলে মেইন ব্রাঞ্চ নিবে
-          git fetch --depth=1 origin 61344663df42 || git fetch --depth=1 origin common-android12-5.10
+          git fetch --depth=1 origin 61344663df42 || git fetch --depth=1 origin common-android12-5.10-lts
           git checkout FETCH_HEAD
 
       - name: Inject NetHunter Configs (WiFi Injection, Monitor Mode, HID)
@@ -70,8 +72,7 @@ jobs:
           cd kernel
           export PATH="$HOME/clang/bin:$PATH"
           make O=out ARCH=arm64 LLVM=1 LLVM_IAS=1 gki_defconfig
-          # ভেন্ডর মডিউলের সাথে ম্যাচ রাখার জন্য ও ফাস্ট বিল্ডের জন্য LTO Thin করা হলো
-          ./scripts/config --file out/.config -d LTO_CLANG_FULL -e LTO_CLANG_THIN -d TRIM_UNUSED_KSYMS
+          ./scripts/config --file out/.config -d LTO_CLANG_FULL -e LTO_CLANG_THIN -d TRIM_UNUSED_KSYMS -d CFI_CLANG
           make O=out ARCH=arm64 LLVM=1 LLVM_IAS=1 -j$(nproc) Image modules
 
       - name: Package Flashable Zip with AnyKernel3
@@ -90,3 +91,4 @@ jobs:
         with:
           name: NetHunter-NX709S-5.10.168
           path: NetHunter-NX709S-5.10.168.zip
+          
