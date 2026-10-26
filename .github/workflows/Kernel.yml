@@ -17,7 +17,7 @@ jobs:
           sudo apt-get update
           sudo apt-get install -y git build-essential bc bison flex libssl-dev libelf-dev \
             lz4 xz-utils wget curl python3 zip unzip cpio pahole \
-            clang-14 lld-14 llvm-14
+            clang-14 lld-14 llvm-14 gcc-aarch64-linux-gnu binutils-aarch64-linux-gnu
 
       - name: Setup Clang-14 as Default Toolchain
         run: |
@@ -26,13 +26,11 @@ jobs:
             ln -sf /usr/bin/${tool}-14 $HOME/clang/bin/${tool}
           done
 
-      - name: Clone Exact Kernel Source (5.10.168 - 61344663df42)
+      - name: Clone Kernel Source (android12-5.10)
         run: |
-          mkdir kernel && cd kernel
-          git init
-          git remote add origin https://android.googlesource.com/kernel/common
-          git fetch --depth=1 origin 61344663df42 || git fetch --depth=1 origin common-android12-5.10-lts
-          git checkout FETCH_HEAD
+          # গুগলের সঠিক ব্রাঞ্চ নেম android12-5.10-lts অথবা android12-5.10 থেকে ক্লোন করা হচ্ছে
+          git clone --depth=1 -b android12-5.10-lts https://android.googlesource.com/kernel/common kernel || \
+          git clone --depth=1 -b android12-5.10 https://android.googlesource.com/kernel/common kernel
 
       - name: Inject NetHunter Configs (WiFi Injection, Monitor Mode, HID)
         run: |
@@ -71,9 +69,14 @@ jobs:
         run: |
           cd kernel
           export PATH="$HOME/clang/bin:$PATH"
-          make O=out ARCH=arm64 LLVM=1 LLVM_IAS=1 gki_defconfig
-          ./scripts/config --file out/.config -d LTO_CLANG_FULL -e LTO_CLANG_THIN -d TRIM_UNUSED_KSYMS -d CFI_CLANG
-          make O=out ARCH=arm64 LLVM=1 LLVM_IAS=1 -j$(nproc) Image modules
+          make O=out ARCH=arm64 LLVM=1 LLVM_IAS=1 CROSS_COMPILE=aarch64-linux-gnu- gki_defconfig
+          ./scripts/config --file out/.config \
+            -d LTO_CLANG_FULL \
+            -e LTO_CLANG_THIN \
+            -d TRIM_UNUSED_KSYMS \
+            -d CFI_CLANG \
+            -d CONFIG_BUILD_ARM64_DT_OVERLAY
+          make O=out ARCH=arm64 LLVM=1 LLVM_IAS=1 CROSS_COMPILE=aarch64-linux-gnu- -j$(nproc) Image modules
 
       - name: Package Flashable Zip with AnyKernel3
         run: |
