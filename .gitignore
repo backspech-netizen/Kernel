@@ -1,0 +1,13 @@
+# Vendored build trees (created by repo sync / local experiments)
+.repo/
+common/
+build/
+prebuilts/
+out/
+ak3/
+
+# Build outputs
+*.ko
+*.zip
+Module.symvers
+build-info.txt
