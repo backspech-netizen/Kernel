@@ -1,0 +1,238 @@
+name: cfg80211 CRC probe (NX709S)
+
+# Probe workflow: builds ONLY net/wireless (cfg80211) under several config
+# variants and checks which variant reproduces the STOCK cfg80211 export
+# CRCs (the 90 symbols stock mac80211 imports). The winning variant goes
+# green (90/90 match). Companion to the main Kernel.yml workflow.
+
+on:
+  workflow_dispatch:
+
+jobs:
+  probe:
+    name: probe-${{ matrix.variant }}
+    runs-on: ubuntu-22.04
+    timeout-minutes: 45
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - variant: control
+            delta: ""
+          - variant: testmode
+            delta: "-e NL80211_TESTMODE"
+          - variant: wext
+            delta: "-e CFG80211_WEXT"
+          - variant: debugfs
+            delta: "-e CFG80211_DEBUGFS"
+          - variant: testmode_wext
+            delta: "-e NL80211_TESTMODE -e CFG80211_WEXT"
+          - variant: testmode_debugfs
+            delta: "-e NL80211_TESTMODE -e CFG80211_DEBUGFS"
+    env:
+      ARCH: arm64
+      CROSS_COMPILE: aarch64-linux-gnu-
+    steps:
+      - name: Free disk space
+        run: |
+          sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc \
+            /usr/local/share/boost "$AGENT_TOOLSDIRECTORY" || true
+          df -h /
+
+      - name: Install build dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y bc bison flex libssl-dev libelf-dev dwarves \
+            build-essential git wget curl python3 lld llvm clang \
+            gcc-aarch64-linux-gnu zip
+
+      - name: Clone pinned kernel source (depth-1, full fallback)
+        run: |
+          set -x
+          COMMIT=61344663df420c35b7d70ac37c28880ffea72f51
+          mkdir common && cd common
+          git init -q
+          git remote add origin https://android.googlesource.com/kernel/common
+          if git fetch -q --depth 1 origin "$COMMIT" && git checkout -q FETCH_HEAD; then
+            echo "depth-1 fetch OK"
+          else
+            cd .. && rm -rf common
+            git clone -q --single-branch -b android12-5.10 https://android.googlesource.com/kernel/common common
+            cd common && git checkout -q "$COMMIT"
+          fi
+          make kernelversion
+
+      - name: Fetch clang r416183b (stock toolchain)
+        run: |
+          mkdir -p toolchain/clang
+          ok=""
+          for br in android12-release android12L-release master; do
+            url="https://android.googlesource.com/platform/prebuilts/clang/host/linux-x86/+archive/refs/heads/${br}/clang-r416183b.tar.gz"
+            if wget -q -O clang.tgz "$url" && tar -tzf clang.tgz >/dev/null 2>&1; then
+              tar -xzf clang.tgz -C toolchain/clang && ok="$br" && break
+            fi
+          done
+          if [ -z "$ok" ]; then echo "gitiles failed, apt clang fallback"; else echo "clang from: $ok"; fi
+          if [ -x toolchain/clang/bin/clang ]; then
+            echo "$PWD/toolchain/clang/bin" >> "$GITHUB_PATH"
+          fi
+          clang --version | head -2
+
+      - name: Configure (v8 base + variant delta)
+        run: |
+          make -C common O=out ARCH=arm64 LLVM=1 LLVM_IAS=1 gki_defconfig
+          common/scripts/config --file common/out/.config \
+            -m CFG80211 -m MAC80211 \
+            -m ATH9K_HTC -m CARL9170 \
+            -m RTL8187 -m RTL8XXXU \
+            -m RT2800USB \
+            -m MT7601U -m MT76x0U -m MT76x2U \
+            -m BT_HCIBTUSB -m BT_HCIVHCI \
+            -m USB_SERIAL -m USB_SERIAL_FTDI_SIO -m USB_SERIAL_CP210X \
+            -m USB_SERIAL_CH341 -m USB_SERIAL_PL2303 \
+            -m USB_USBNET -m USB_NET_AX8817X -m USB_NET_CDCETHER -m USB_NET_RNDIS_HOST
+          common/scripts/config --file common/out/.config \
+            -m ZD1211RW -m RT73USB -m RT2500USB -m RTL8192CU \
+            -m ATH10K -m ATH10K_USB \
+            -m USB_RTL8152 -m USB_NET_SMSC75XX -m USB_NET_SMSC95XX -m USB_NET_DM9601 \
+            -m CAN -m CAN_DEV -m CAN_GS_USB -m CAN_SLCAN \
+            -m NFC -m NFC_PN533 -m NFC_PN533_USB \
+            -m IEEE802154 -m IEEE802154_ATUSB \
+            -m MEDIA_SUPPORT -m DVB_CORE -m DVB_USB_V2 -m DVB_USB_RTL28XXU \
+            -m USB_SERIAL_OPTION -m USB_SERIAL_QUALCOMM -m BT_HCIUART
+          common/scripts/config --file common/out/.config -e MEDIA_USB_SUPPORT
+          common/scripts/config --file common/out/.config \
+            -e LTO_CLANG_THIN -d LTO_CLANG_FULL
+          common/scripts/config --file common/out/.config \
+            -e WLAN_VENDOR_ATH -e WLAN_VENDOR_RALINK \
+            -e WLAN_VENDOR_REALTEK -e WLAN_VENDOR_MEDIATEK \
+            -m RT2X00 \
+            -m MT76_CORE -m MT76_USB -m MT76x02_LIB -m MT76x02_USB \
+            -m MT76x0_COMMON -m MT76x2_COMMON
+          if [ -n "${{ matrix.delta }}" ]; then
+            common/scripts/config --file common/out/.config ${{ matrix.delta }}
+          fi
+          make -C common O=out ARCH=arm64 LLVM=1 LLVM_IAS=1 olddefconfig
+          grep -E 'CONFIG_(NL80211_TESTMODE|CFG80211_WEXT|CFG80211_DEBUGFS)=' common/out/.config || \
+            echo "(testmode/wext/debugfs all off in this variant)"
+
+      - name: Build cfg80211 only
+        run: |
+          make -C common O=out ARCH=arm64 LLVM=1 LLVM_IAS=1 -j"$(nproc)" modules_prepare
+          # Directory target, NOT M= : the M= build breaks net/wireless
+          # trace.h inclusion ('./trace.h' file not found); the in-tree
+          # directory traversal is the same path the main build uses.
+          make -C common O=out ARCH=arm64 LLVM=1 LLVM_IAS=1 -j"$(nproc)" net/wireless/
+          find common/out -name 'cfg80211.ko' -o -name 'Module.symvers' | head
+
+      - name: Compare CRCs against stock panel
+        run: |
+          cat > panel.txt <<'PANEL_EOF'
+          bridge_tunnel_header 0x1879fcbd
+          cfg80211_abandon_assoc 0x47feec88
+          cfg80211_assoc_timeout 0xbf0d21e7
+          cfg80211_auth_timeout 0x7040ce47
+          cfg80211_cac_event 0x84e605dc
+          cfg80211_calculate_bitrate 0x15a37cf3
+          cfg80211_ch_switch_notify 0x7c04a552
+          cfg80211_ch_switch_started_notify 0xe9afd501
+          cfg80211_chandef_compatible 0x3d8e5894
+          cfg80211_chandef_create 0xef265f27
+          cfg80211_chandef_dfs_required 0x8b2ce24f
+          cfg80211_chandef_usable 0xcaa0146f
+          cfg80211_chandef_valid 0x2a5d816f
+          cfg80211_check_combinations 0xfcbb8c68
+          cfg80211_check_station_change 0xa57df256
+          cfg80211_classify8021d 0x26e21b82
+          cfg80211_control_port_tx_status 0xe21ebfa5
+          cfg80211_cqm_beacon_loss_notify 0x606a6d4c
+          cfg80211_cqm_pktloss_notify 0xa2d000cc
+          cfg80211_cqm_rssi_notify 0x3759f2b6
+          cfg80211_del_sta_sinfo 0x148cb80e
+          cfg80211_find_elem_match 0x9d6cba30
+          cfg80211_free_nan_func 0xeadfe024
+          cfg80211_get_bss 0x3a63d1bc
+          cfg80211_get_drvinfo 0xb96412b0
+          cfg80211_get_p2p_attr 0xf5596d89
+          cfg80211_gtk_rekey_notify 0x77684f21
+          cfg80211_ibss_joined 0xdf239b7f
+          cfg80211_iftype_allowed 0xe97efa4c
+          cfg80211_inform_bss_frame_data 0x6fc51b51
+          cfg80211_is_element_inherited 0xcc1a7c48
+          cfg80211_iter_combinations 0xe1d1eaf8
+          cfg80211_merge_profile 0x117aca91
+          cfg80211_mgmt_tx_status 0x6c5f9bf5
+          cfg80211_michael_mic_failure 0x5f4d63da
+          cfg80211_nan_func_terminated 0x39bac0fc
+          cfg80211_nan_match 0xae02d056
+          cfg80211_new_sta 0xf01b72dc
+          cfg80211_probe_status 0xe34cbcf2
+          cfg80211_put_bss 0xc2a311b8
+          cfg80211_radar_event 0xe9f61718
+          cfg80211_ready_on_channel 0x3f482687
+          cfg80211_ref_bss 0x220d6472
+          cfg80211_reg_can_beacon 0x03880859
+          cfg80211_reg_can_beacon_relax 0x8785fc4d
+          cfg80211_remain_on_channel_expired 0xdf903a43
+          cfg80211_report_obss_beacon_khz 0xf33c2425
+          cfg80211_report_wowlan_wakeup 0x1f99948b
+          cfg80211_rx_assoc_resp 0xba2b4d2a
+          cfg80211_rx_control_port 0x3482175a
+          cfg80211_rx_mgmt_khz 0x57dfa00e
+          cfg80211_rx_mlme_mgmt 0x5654acf0
+          cfg80211_rx_spurious_frame 0x9599078b
+          cfg80211_rx_unexpected_4addr_frame 0x801de8bb
+          cfg80211_rx_unprot_mlme_mgmt 0x6c3d6742
+          cfg80211_scan_done 0x9890d055
+          cfg80211_sched_scan_results 0x5e504522
+          cfg80211_sched_scan_stopped 0x44a9d82e
+          cfg80211_sched_scan_stopped_rtnl 0x5c709341
+          cfg80211_send_layer2_update 0x4d6daad4
+          cfg80211_shutdown_all_interfaces 0xfdd17b35
+          cfg80211_sinfo_alloc_tid_stats 0x4e634e0b
+          cfg80211_sta_opmode_change_notify 0x11bbcd6d
+          cfg80211_stop_iface 0x0bb8de6f
+          cfg80211_tdls_oper_request 0xdb49bc14
+          cfg80211_tx_mgmt_expired 0x1a1b2651
+          cfg80211_tx_mlme_mgmt 0xd29a461f
+          cfg80211_unlink_bss 0x60086fcb
+          cfg80211_unregister_wdev 0x78912f9f
+          freq_reg_info 0xfe9f85c7
+          ieee80211_amsdu_to_8023s 0x5f050beb
+          ieee80211_bss_get_elem 0x0e7f4a43
+          ieee80211_chandef_to_operating_class 0xb73aafb1
+          ieee80211_channel_to_freq_khz 0xc1b99792
+          ieee80211_data_to_8023_exthdr 0xd23ce56a
+          ieee80211_freq_khz_to_channel 0x6bedf402
+          ieee80211_get_channel_khz 0x02016da9
+          ieee80211_hdrlen 0x7ef39823
+          ieee80211_ie_split_ric 0x275269b3
+          ieee80211_mandatory_rates 0x1356ab28
+          ieee80211_operating_class_to_band 0xc5dcacef
+          ieee80211_radiotap_iterator_init 0xac97a207
+          ieee80211_radiotap_iterator_next 0x46312808
+          ieee80211_s1g_channel_width 0x27efff25
+          regulatory_pre_cac_allowed 0x5261d669
+          rfc1042_header 0x69b18f43
+          wiphy_free 0x5e97829f
+          wiphy_new_nm 0xac389d85
+          wiphy_register 0x4d2abffe
+          wiphy_unregister 0xca357b06
+          PANEL_EOF
+          SYM=$(find common/out -path '*net/wireless*Module.symvers' | head -1)
+          if [ -z "$SYM" ]; then SYM=$(grep -rl 'wiphy_new_nm' common/out --include='Module.symvers' | head -1); fi
+          echo "Using symvers: $SYM"
+          match=0; total=0; diffs=""
+          while read -r name want; do
+            total=$((total+1))
+            got=$(awk -v n="$name" '$2==n {print $1}' "$SYM" | head -1)
+            if [ "$got" = "$want" ]; then
+              match=$((match+1))
+            else
+              diffs="$diffs\n  DIFF $name want=$want got=${got:-NONE}"
+            fi
+          done < panel.txt
+          echo "RESULT variant=${{ matrix.variant }}: $match/$total cfg80211 CRCs match stock"
+          if [ "$match" != "$total" ]; then printf "$diffs\n"; fi
+          grep -E 'wiphy_new_nm' "$SYM" || true
+          test "$match" = "$total"
