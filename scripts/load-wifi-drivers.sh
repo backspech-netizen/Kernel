@@ -1,6 +1,6 @@
 #!/system/bin/sh
 # ============================================================
-# NetHunter external adapter driver loader v2 (NX709S, stock kernel)
+# NetHunter external adapter driver loader v3 (NX709S, stock kernel)
 #
 # Stock ROM already loads cfg80211 + mac80211 at boot, so this script
 # loads ONLY the adapter driver chains built by the GitHub workflow.
@@ -21,7 +21,7 @@ FWDIR=/data/local/nethunter/firmware
 SWAP=0
 [ "$1" = "--swap-mac80211" ] && SWAP=1
 
-echo "== NetHunter adapter driver loader v2 =="
+echo "== NetHunter adapter driver loader v3 =="
 
 if [ ! -d "$MODDIR" ]; then
   echo "ERROR: modules folder পাওয়া যায়নি: $MODDIR"
@@ -50,6 +50,12 @@ try_load() {
     failed="$failed $name(insmod-failed)"
   fi
 }
+
+# --- Compat shim FIRST (v11): re-provides the exports the stock GKI
+# kernel trimmed (usb_init_urb, clk_get_sys, led_classdev_suspend, ...)
+# plus crc-ccitt, which rt2800lib and mac802154 depend on. ---
+try_load nethunter_compat nethunter_compat.ko
+try_load crc_ccitt        crc-ccitt.ko
 
 # --- Optional: swap stock mac80211 for ours (CRC fallback) ---
 if [ "$SWAP" = "1" ]; then
@@ -109,6 +115,40 @@ try_load usbnet        usbnet.ko
 try_load asix          asix.ko
 try_load cdc_ether     cdc_ether.ko
 try_load rndis_host    rndis_host.ko
+try_load r8152         r8152.ko
+try_load smsc75xx      smsc75xx.ko
+try_load smsc95xx      smsc95xx.ko
+try_load dm9601        dm9601.ko
+
+# --- v7 extra WiFi (zd1211, rt73/rt2500, rtl8192cu, ath10k-usb) ---
+try_load zd1211rw      zd1211rw.ko
+try_load rt73usb       rt73usb.ko
+try_load rt2500usb     rt2500usb.ko
+try_load rtlwifi       rtlwifi.ko
+try_load rtl8192c_common rtl8192c-common.ko
+try_load rtl_usb       rtl_usb.ko
+try_load rtl8192cu     rtl8192cu.ko
+try_load ath10k_core   ath10k_core.ko
+try_load ath10k_usb    ath10k_usb.ko
+
+# --- v7 CAN bus / NFC / 802.15.4 / RTL-SDR (best effort) ---
+try_load can           can.ko
+try_load can_raw       can-raw.ko
+try_load can_dev       can-dev.ko
+try_load gs_usb        gs_usb.ko
+try_load slcan         slcan.ko
+try_load nfc           nfc.ko
+try_load pn533         pn533.ko
+try_load pn533_usb     pn533_usb.ko
+try_load ieee802154    ieee802154.ko
+try_load mac802154     mac802154.ko
+try_load atusb         atusb.ko
+try_load dvb_core      dvb-core.ko
+try_load dvb_usb_v2    dvb_usb_v2.ko
+try_load rtl2830       rtl2830.ko
+try_load rtl2832       rtl2832.ko
+try_load r820t         r820t.ko
+try_load dvb_usb_rtl28xxu dvb_usb_rtl28xxu.ko
 
 echo ""
 echo "Loaded :$loaded"
