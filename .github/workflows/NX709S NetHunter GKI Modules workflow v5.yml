@@ -152,9 +152,25 @@ jobs:
           # CRCs are computed from source by genksyms, so this is safe.
           common/scripts/config --file common/out/.config \
             -e LTO_CLANG_THIN -d LTO_CLANG_FULL
+          # CRITICAL (v6): gki_defconfig turns the WLAN VENDOR GATES OFF.
+          # Every WiFi driver lives inside `if WLAN_VENDOR_*` blocks, so
+          # without these the driver symbols are silently dropped by
+          # olddefconfig (this is why the v5 artifact had no WiFi .ko).
+          common/scripts/config --file common/out/.config \
+            -e WLAN_VENDOR_ATH -e WLAN_VENDOR_RALINK \
+            -e WLAN_VENDOR_REALTEK -e WLAN_VENDOR_MEDIATEK
           make -C common O=out ARCH=arm64 LLVM=1 LLVM_IAS=1 olddefconfig
           echo "--- Effective config (drivers) ---"
           grep -E 'CONFIG_(ATH9K_HTC|CARL9170|RTL8187|RTL8XXXU|RT2800USB|MT7601U|MT76x0U|MT76x2U|BT_HCIBTUSB|USB_SERIAL|USB_USBNET)=' common/out/.config || true
+          # Fail LOUDLY if any driver got dropped again - never ship a
+          # silently incomplete artifact.
+          for s in ATH9K_HTC CARL9170 RTL8187 RTL8XXXU RT2800USB MT7601U MT76x0U MT76x2U; do
+            if ! grep -q "^CONFIG_${s}=m" common/out/.config; then
+              echo "::error::CONFIG_${s} did not stick - aborting"
+              exit 1
+            fi
+          done
+          echo "All WiFi driver configs confirmed =m"
 
       - name: Build Image + modules
         run: |
@@ -176,11 +192,27 @@ jobs:
           cp common/out/Module.symvers artifact-modules/ 2>/dev/null || true
           cp build-info.txt artifact-modules/
           cp scripts/load-wifi-drivers.sh scripts/unload-wifi-drivers.sh artifact-modules/
+          # Strip debug info (raw .ko files are tens of MB; loading does not
+          # need it) - best effort only.
+          if command -v llvm-strip >/dev/null 2>&1; then
+            for f in artifact-modules/modules/*.ko artifact-modules/fallback/*.ko; do
+              llvm-strip --strip-debug "$f" 2>/dev/null || true
+            done
+          fi
           echo "--- modules/ ---"; ls artifact-modules/modules/
           echo "--- fallback/ ---"; ls artifact-modules/fallback/
+          # Fail LOUDLY if the WiFi drivers are missing again.
+          for f in ath9k_htc.ko ath9k_hw.ko ath.ko rt2800usb.ko mt7601u.ko rtl8187.ko rtl8xxxu.ko carl9170.ko; do
+            if [ ! -f "artifact-modules/modules/$f" ]; then
+              echo "::error::Expected module $f missing from artifact"
+              exit 1
+            fi
+          done
+          echo "All key WiFi modules present in artifact"
 
       - name: Upload modules artifact
         uses: actions/upload-artifact@v4
         with:
           name: nx709s-nethunter-modules
           path: artifact-modules/
+          
