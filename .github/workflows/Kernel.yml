@@ -4,22 +4,25 @@ name: NX709S NetHunter GKI Modules
 # (NX709S) STOCK kernel. Nothing is flashed; modules are loaded at runtime.
 #
 # Verified device facts (2026-10-29):
-#   - Stock kernel 5.10.168-android12-9 (pristine Google GKI, clang r416183b)
+#   - Stock kernel 5.10.168-android12-9-00001-g61344663df42 (pristine Google
+#     GKI, clang 12.0.5 r416183b), KMI android12-9
 #   - cfg80211 + mac80211 are ALREADY loaded by the stock ROM at boot
-#     (they ship in the vendor boot path, not as files in any dlkm partition)
 #   - Only the adapter driver chains are missing -> that is all we build.
 #
-# The kernel source is PINNED to the GKI monthly release matching the stock
-# kernel (5.10.168, KMI android12-9). The build FAILS if the checked-out
-# version is not exactly 5.10.168, to protect symbol-CRC compatibility.
+# PIN STRATEGY (v3): Google deleted the monthly kernel/common branches
+# (android12-5.10-2023-04 no longer exists), so the repo-tool manifest route
+# is dead. Instead we clone kernel/common's android12-5.10 branch and check
+# out the EXACT commit the stock kernel was built from: 61344663df42 (it is
+# written in the phone's own kernel version string). The build FAILS if the
+# checked-out kernel version is not exactly 5.10.168.
 
 on:
   workflow_dispatch:
     inputs:
-      manifest_branch:
-        description: "Kernel manifest branch (pin)"
+      kernel_commit:
+        description: "kernel/common commit of the stock kernel"
         type: string
-        default: common-android12-5.10-2023-04
+        default: "61344663df42"
       allow_version_mismatch:
         description: "Continue even if kernel version is not 5.10.168"
         type: boolean
@@ -48,60 +51,61 @@ jobs:
         run: |
           sudo apt-get update
           sudo apt-get install -y bc bison flex libssl-dev libelf-dev dwarves \
-            zip unzip python3 gcc-aarch64-linux-gnu
-          git config --global user.email "build@localhost"
-          git config --global user.name "kernel-build"
-          mkdir -p "$HOME/bin"
-          curl -s https://storage.googleapis.com/git-repo-downloads/repo -o "$HOME/bin/repo"
-          chmod a+x "$HOME/bin/repo"
-          echo "$HOME/bin" >> "$GITHUB_PATH"
+            zip unzip python3 gcc-aarch64-linux-gnu curl git
 
-      - name: Fetch pinned GKI kernel source (repo tool)
+      - name: Clone kernel/common and check out the exact stock commit
         run: |
           set -e
-          ok=""
-          for B in "${{ inputs.manifest_branch }}" common-android12-5.10-2023-03 common-android12-5.10-2023-05 common-android12-5.10; do
-            echo "=== Trying manifest branch: $B ==="
-            if repo init -u https://android.googlesource.com/kernel/manifest -b "$B"; then
-              echo "MANIFEST_BRANCH=$B" >> "$GITHUB_ENV"
-              ok=1
-              break
-            fi
-          done
-          if [ -z "$ok" ]; then
-            echo "::error::repo init failed for all candidate branches"
-            exit 1
-          fi
-          repo sync -c --no-tags --optimized-fetch --force-sync -j"$(nproc)"
+          git clone --single-branch --branch android12-5.10 --no-checkout \
+            https://android.googlesource.com/kernel/common common
+          cd common
+          FULL=$(git rev-parse "${{ inputs.kernel_commit }}^{commit}")
+          echo "Stock kernel commit: $FULL"
+          git checkout "$FULL"
+          {
+            echo "kernel_commit=$FULL"
+            echo "kernel_describe=$(git describe --always || true)"
+          } > ../build-info.txt
+          cat ../build-info.txt
 
       - name: Verify kernel version pin (must be 5.10.168)
         run: |
           KV=$(make -s -C common kernelversion)
           echo "Kernel version from source: $KV"
-          {
-            echo "manifest_branch=$MANIFEST_BRANCH"
-            echo "kernel_version=$KV"
-            echo "common HEAD: $(git -C common log -1 --oneline || true)"
-          } > build-info.txt
+          echo "kernel_version=$KV" >> build-info.txt
           cat build-info.txt
           if [ "$KV" != "5.10.168" ] && [ "${{ inputs.allow_version_mismatch }}" != "true" ]; then
-            echo "::error::Pinned source is $KV, not 5.10.168. Aborting to protect KMI/CRC compatibility. Set allow_version_mismatch=true to override."
+            echo "::error::Checked-out source is $KV, not 5.10.168. Aborting to protect KMI/CRC compatibility. Set allow_version_mismatch=true to override."
             exit 1
           fi
 
-      - name: Set up toolchain paths
+      - name: Fetch clang r416183b (stock toolchain)
         run: |
-          CLANG_DIR=$(ls -d "$GITHUB_WORKSPACE"/prebuilts/clang/host/linux-x86/clang-r416183b* 2>/dev/null | head -n1)
-          if [ -z "$CLANG_DIR" ]; then
-            CLANG_DIR=$(ls -d "$GITHUB_WORKSPACE"/prebuilts/clang/host/linux-x86/clang-* 2>/dev/null | sort | head -n1)
+          set -e
+          mkdir -p toolchain/clang
+          ok=""
+          for U in \
+            "https://android.googlesource.com/platform/prebuilts/clang/host/linux-x86/+archive/refs/heads/android12-release/clang-r416183b.tar.gz" \
+            "https://android.googlesource.com/platform/prebuilts/clang/host/linux-x86/+archive/refs/heads/android12L-release/clang-r416183b.tar.gz" \
+            "https://android.googlesource.com/platform/prebuilts/clang/host/linux-x86/+archive/refs/heads/master/clang-r416183b.tar.gz"; do
+            echo "=== Trying: $U ==="
+            if curl -fL "$U" -o toolchain/clang.tar.gz; then ok=1; break; fi
+          done
+          if [ -n "$ok" ]; then
+            tar -xzf toolchain/clang.tar.gz -C toolchain/clang
+            CLANG_BIN="$GITHUB_WORKSPACE/toolchain/clang/bin"
+            "$CLANG_BIN/clang" --version | head -1
+          else
+            echo "::warning::r416183b archive unavailable - falling back to distro clang (symbol CRCs do not depend on the compiler)"
+            sudo apt-get install -y clang lld llvm
+            CLANG_BIN="/usr/bin"
           fi
-          echo "Using clang: $CLANG_DIR"
-          GCC_DIR="$GITHUB_WORKSPACE/prebuilts/gcc/linux-x86/aarch64/aarch64-linux-android-4.9/bin"
-          echo "$CLANG_DIR/bin:$GCC_DIR" >> "$GITHUB_PATH"
+          echo "$CLANG_BIN" >> "$GITHUB_PATH"
           {
             echo "ARCH=arm64"
-            echo "CROSS_COMPILE=aarch64-linux-android-"
+            echo "CROSS_COMPILE=aarch64-linux-gnu-"
           } >> "$GITHUB_ENV"
+          echo "clang_dir=$CLANG_BIN" >> build-info.txt
 
       - name: Configure adapter drivers as modules (=m)
         run: |
